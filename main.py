@@ -51,9 +51,32 @@ def get_conn():
             FOREIGN KEY(user_id) REFERENCES users(id)
         );
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            category TEXT NOT NULL,
+            date TEXT NOT NULL,
+            note TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+    """)
+    # <<< НОВОЕ: таблица пользовательских категорий >>>
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            UNIQUE(user_id, name),
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+    """)
 
     conn.commit()
     return conn
+
+
 
 def hash_password(p: str) -> str:
     # Minimal demo hashing (not for production)
@@ -127,6 +150,26 @@ def kpi_from_df(df: pd.DataFrame) -> tuple[float, float, int]:
 # ---------- Session ----------
 if "user" not in st.session_state:
     st.session_state.user = None  # {"id": int, "email": str}
+
+# ---------- Categories (base + custom) ----------
+
+def get_user_categories(conn, user_id: int) -> list[str]:
+    """Пользовательские категории из таблицы user_categories."""
+    cur = conn.execute(
+        "SELECT name FROM user_categories WHERE user_id = ? ORDER BY name",
+        (user_id,),
+    )
+    rows = cur.fetchall()
+    return [r[0] for r in rows]
+
+def get_all_categories(conn, user_id: int) -> list[str]:
+    """Базовые + пользовательские категории (без дублей)."""
+    base = CATEGORIES.copy()
+    user_cats = get_user_categories(conn, user_id)
+    for c in user_cats:
+        if c not in base:
+            base.append(c)
+    return base
 
 
 # -----------> UI: Header <---------------
@@ -237,12 +280,113 @@ if not st.session_state.user:
 
 user_id = st.session_state.user["id"]
 
+# ---------- Add Category ----------
+# ---------- Add Category ----------
+st.markdown("### Add category")
+
+left_col, right_col = st.columns([2, 2])
+
+# Инициализация состояния для поля и сообщений
+if "new_category_name" not in st.session_state:
+    st.session_state.new_category_name = ""
+
+if "add_cat_feedback" not in st.session_state:
+    st.session_state.add_cat_feedback = None  # (level, text)
 
 
+# --- колбэк для кнопки Add ---
+def handle_add_category():
+    name = (st.session_state.new_category_name or "").strip()
 
+    if not name:
+        st.session_state.add_cat_feedback = ("warning", "Please enter a category name.")
+        return
+
+    all_cats_lower = [c.lower() for c in get_all_categories(conn, user_id)]
+    if name.lower() in all_cats_lower:
+        st.session_state.add_cat_feedback = ("info", "This category already exists.")
+        return
+
+    # пишем в БД
+    conn.execute(
+        "INSERT INTO user_categories (user_id, name) VALUES (?, ?)",
+        (user_id, name),
+    )
+    conn.commit()
+
+    # сообщение + очистка поля
+    st.session_state.add_cat_feedback = ("success", f"Category '{name}' added.")
+    st.session_state.new_category_name = ""
+
+
+# ---------- ЛЕВАЯ ЧАСТЬ: добавить категорию ----------
+with left_col:
+    st.write(
+        "Create your own spending or income category. "
+        "New categories will appear in all dropdown lists (transactions, filters, budgets)."
+    )
+
+    st.text_input(
+        "Category name",
+        key="new_category_name",
+        placeholder="e.g. Pets, Gifts, Freelance",
+    )
+
+    st.button(
+        "Add",
+        key="add_category_button",
+        on_click=handle_add_category,
+    )
+
+    # показываем сообщение из состояния
+    fb = st.session_state.add_cat_feedback
+    if fb:
+        level, msg = fb
+        if level == "success":
+            st.success(msg)
+        elif level == "warning":
+            st.warning(msg)
+        elif level == "info":
+            st.info(msg)
+
+# ---------- ПРАВАЯ ЧАСТЬ: удалить существующую категорию ----------
+with right_col:
+    st.write("Delete an existing category")
+
+    existing_cats = get_all_categories(conn, user_id)
+
+    if not existing_cats:
+        st.caption("There are no categories to display.")
+    else:
+        cat_to_delete = st.selectbox(
+            "Select category",
+            options=existing_cats,
+            key="delete_category_select",
+        )
+
+        delete_cat_clicked = st.button(
+            "Delete",
+            key="delete_category_button",
+            type="secondary",
+        )
+
+        if delete_cat_clicked:
+            if cat_to_delete in CATEGORIES:
+                st.warning("Base categories cannot be deleted.")
+            else:
+                conn.execute(
+                    "DELETE FROM user_categories WHERE user_id = ? AND name = ?",
+                    (user_id, cat_to_delete),
+                )
+                conn.commit()
+                st.success(f"Category '{cat_to_delete}' deleted.")
 
 
 # ---------- Budget ----------
+
+st.markdown("### Set budget")
+st.write("Set a monthly budget for each category below.")
+
 
 st.markdown("""
 <style>
@@ -260,18 +404,19 @@ button[kind="secondary"][data-testid="baseButton-secondary"] {
 </style>
 """, unsafe_allow_html=True)
 
-
-
 with st.form("set_budget_form_budget", clear_on_submit=False):
     # Wrap buttons in a container for CSS targeting
     st.markdown('<div class="budget-form">', unsafe_allow_html=True)
 
     bc1, bc2, bc3, bc4 = st.columns([1, 1, 1, 1])
 
+    # все категории (базовые + добавленные через "Add category")
+    all_categories_for_budget = get_all_categories(conn, user_id)
+
     with bc1:
         budget_category = st.selectbox(
             "Category",
-            options=CATEGORIES,
+            options=all_categories_for_budget,
             key="budget_category_form",
             help="Start typing to search categories",
         )
@@ -321,11 +466,13 @@ if reset_all_clicked:
 
 
 
-
 # ---------- Budget Status Grid ----------
-# Show budget status for ALL categories (4 per row)
+# ---------- Budget Status Grid (first 8 + expandable rest) ----------
 
-# Load all budgets for this user
+st.markdown("### Budget overview")
+st.markdown("Here you can see your category budgets and how much you’ve spent.")
+
+# Загружаем бюджеты
 cur_all = conn.execute(
     "SELECT category, amount FROM budgets WHERE user_id = ?",
     (user_id,),
@@ -333,57 +480,70 @@ cur_all = conn.execute(
 
 budget_map = {row[0]: float(row[1]) for row in cur_all}
 
-# Create grid: 4 blocks per row
-cols = st.columns(4)
+# Получаем все категории (включая кастомные, если они есть)
+all_categories = get_all_categories(conn, user_id)
 
-# Iterate through all categories
-for i, cat in enumerate(CATEGORIES):
-    # Calculate spent amount in this category
-    cur_s = conn.execute(
-        "SELECT SUM(amount) FROM transactions WHERE user_id = ? AND category = ?",
-        (user_id, cat),
-    )
-    row_s = cur_s.fetchone()
-    spent_val = float(row_s[0]) if row_s and row_s[0] is not None else 0.0
 
-    # Get budget if exists
-    budget_val = budget_map.get(cat, 0.0)
+# Разделяем первые 8 и остальные
+first_block = all_categories[:8]
+rest_block = all_categories[8:]
 
-    # Determine fill percentage
-    percent = (spent_val / budget_val * 100.0) if budget_val > 0 else 0.0
-
-    # Determine color based on thresholds
-    if budget_val == 0:
-        bg = "#f0f0f0"      # grey
-        border = "#cccccc"
-    elif percent < 80:
-        bg = "#e6f4ea"      # green
-        border = "#34a853"
-    elif percent < 100:
-        bg = "#fff4e5"      # orange
-        border = "#f9ab00"
-    else:
-        bg = "#fce8e6"      # red
-        border = "#d93025"
-
-    # Render small budget card (no delete / reset button here)
-    with cols[i % 4]:
-        st.markdown(
-            f"""
-            <div style="
-                border:1px solid {border};
-                background:{bg};
-                border-radius:6px;
-                padding:0.5rem 0.6rem;
-                margin-bottom:0.6rem;
-                font-size:0.75rem;
-            ">
-                <b>{cat}</b><br>
-                {"No budget set" if budget_val == 0 else f"${spent_val:,.2f} / ${budget_val:,.2f} ({percent:.1f}%)"}
-            </div>
-            """,
-            unsafe_allow_html=True,
+# --- Функция рисования карточек ---
+def draw_budget_cards(category_list):
+    cols = st.columns(4)
+    for i, cat in enumerate(category_list):
+        # spent
+        cur_s = conn.execute(
+            "SELECT SUM(amount) FROM transactions WHERE user_id = ? AND category = ?",
+            (user_id, cat),
         )
+        row_s = cur_s.fetchone()
+        spent_val = float(row_s[0]) if row_s and row_s[0] is not None else 0.0
+
+        # budget
+        budget_val = budget_map.get(cat, 0.0)
+
+        # color
+        percent = (spent_val / budget_val * 100.0) if budget_val > 0 else 0.0
+        if budget_val == 0:
+            bg = "#f0f0f0"
+            border = "#cccccc"
+        elif percent < 80:
+            bg = "#e6f4ea"
+            border = "#34a853"
+        elif percent < 100:
+            bg = "#fff4e5"
+            border = "#f9ab00"
+        else:
+            bg = "#fce8e6"
+            border = "#d93025"
+
+        with cols[i % 4]:
+            st.markdown(
+                f"""
+                <div style="
+                    border:1px solid {border};
+                    background:{bg};
+                    border-radius:6px;
+                    padding:0.5rem 0.6rem;
+                    margin-bottom:0.6rem;
+                    font-size:0.75rem;
+                ">
+                    <b>{cat}</b><br>
+                    {"No budget set" if budget_val == 0 else f"HUF{spent_val:,.2f} / HUF{budget_val:,.2f} ({percent:.1f}%)"}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+# --- Рисуем первые 8 категорий ---
+draw_budget_cards(first_block)
+
+# --- Остальные показываем только внутри expander ---
+if rest_block:
+    with st.expander("Show more categories", expanded=False):
+        draw_budget_cards(rest_block)
+
 
 
 
@@ -397,10 +557,11 @@ with st.form("add_tx_form", clear_on_submit=True):
     with c2:
         category = st.selectbox(
             "Category",
-            options=CATEGORIES,
+            options=get_all_categories(conn, user_id),
             key="add_category",
             help="Start typing to search categories",
         )
+
         #category = st.text_input("Category", placeholder="Food / Transport / ...")
     with c3:
         d = st.date_input("Date", value=date.today(), format="YYYY-MM-DD")
@@ -420,37 +581,66 @@ df = load_transactions_df(conn, user_id)
 
 k1, k2, k3 = st.columns(3)
 total, avg_per_day, tx_count = kpi_from_df(df)
-k1.metric("Total Spending", f"${total:,.2f}")
-k2.metric("Avg per Day", f"${avg_per_day:,.2f}")
+k1.metric("Total Spending", f"HUF{total:,.2f}")
+k2.metric("Avg per Day", f"HUF{avg_per_day:,.2f}")
 k3.metric("Transactions", f"{tx_count}")
 
 # Filters
 st.markdown("### Filters")
 
-def apply_filters(_df: pd.DataFrame, cat_sub: str, from_iso: str, to_iso: str) -> pd.DataFrame:
+def apply_filters(
+    _df: pd.DataFrame,
+    cat: str | None,
+    from_dt: date | None,
+    to_dt: date | None,
+) -> pd.DataFrame:
     out = _df.copy()
-    if cat_sub.strip():
-        out = out[out["category"].str.contains(cat_sub.strip(), case=False, na=False)]
-    if from_iso.strip():
-        out = out[out["date"] >= from_iso.strip()]
-    if to_iso.strip():
-        out = out[out["date"] <= to_iso.strip()]
+
+    # фильтр по категории (точный выбор из списка)
+    if cat and cat != "All":
+        out = out[out["category"] == cat]
+
+    # фильтры по датам (даты из календаря конвертим в ISO-строку)
+    if from_dt:
+        out = out[out["date"] >= from_dt.isoformat()]
+    if to_dt:
+        out = out[out["date"] <= to_dt.isoformat()]
+
     return out
 
 # Inputs live inside the expander but we compute df_filtered afterwards (no else!)
 with st.expander("Filters", expanded=False):
     fc1, fc2, fc3 = st.columns(3)
     with fc1:
-        cat_filter = st.text_input("Category contains", value="", key="cat_filter")
+        # выбор категории из списка (включая "All" и кастомные)
+        cat_filter = st.selectbox(
+            "Category",
+            options=["All"] + get_all_categories(conn, user_id),
+            index=0,
+            key="cat_filter",
+            help="Choose category to filter or All",
+        )
+
     with fc2:
-        from_date = st.text_input("From (YYYY-MM-DD)", value="", key="from_date")
+        # календарь для выбора даты "от"
+        from_date = st.date_input(
+            "From",
+            key="from_date",
+        )
     with fc3:
-        to_date = st.text_input("To (YYYY-MM-DD)", value="", key="to_date")
+        # календарь для выбора даты "до"
+        to_date = st.date_input(
+            "To",
+            key="to_date",
+        )
 
 # Compute filtered dataframe
-df_filtered = apply_filters(df, st.session_state.get("cat_filter",""),
-                               st.session_state.get("from_date",""),
-                               st.session_state.get("to_date",""))
+df_filtered = apply_filters(
+    df,
+    cat_filter,
+    from_date,
+    to_date,
+)
 
 
 # Pie chart by category + 7-day moving average & forecast
@@ -538,14 +728,33 @@ else:
             st.info("Not enough data to build forecast yet.")
 
 
-# Transactions table with inline edit/delete
-st.markdown("### Transactions")
+# Transactions table with inline edit/delete + report download
+
+# Заголовок + кнопка отчёта в одной строке
+header_col, btn_col = st.columns([0.7, 0.3])
+with header_col:
+    st.markdown("### Transactions")
+with btn_col:
+    if not df_filtered.empty:
+        # CSV с разделителем ';' и BOM, чтобы Excel нормально открыл по столбцам
+        csv_data = df_filtered.to_csv(
+            index=False,
+            sep=";",  # <-- главное: разделитель ; вместо ,
+        ).encode("utf-8-sig")  # <-- BOM, чтобы Excel корректно понял UTF-8
+
+        st.download_button(
+            label="Export report(CSV)",
+            data=csv_data,
+            file_name="transactions_report.csv",
+            mime="text/csv",
+        )
+
 if df_filtered.empty:
     st.info("No transactions yet.")
 else:
     # Show editable table row-by-row
     for _, row in df_filtered.iterrows():
-        with st.expander(f"{row['date']} — {row['category']} — ${row['amount']:.2f}", expanded=False):
+        with st.expander(f"{row['date']} — {row['category']} — HUF{row['amount']:.2f}", expanded=False):
             ec1, ec2, ec3, ec4, ec5 = st.columns([1, 1, 1, 2, 1])
             with ec1:
                 new_amount = st.number_input(
@@ -556,9 +765,9 @@ else:
                     key=f"edit_amount_{int(row['id'])}",
                     value=float(row["amount"]),
                 )
-            # type of categories
+
             with ec2:
-                edit_categories = CATEGORIES.copy()
+                edit_categories = get_all_categories(conn, user_id)
                 if row["category"] not in edit_categories:
                     edit_categories.append(row["category"])
 
@@ -569,6 +778,7 @@ else:
                     key=f"edit_category_{int(row['id'])}",
                     help="Start typing to search categories",
                 )
+
             with ec3:
                 # Use text input for ISO flexibility
                 new_date = st.text_input(
@@ -585,7 +795,15 @@ else:
             with ec5:
                 if st.button("Save", key=f"save_{int(row['id'])}"):
                     if new_amount and new_category and new_date:
-                        update_tx(conn, user_id, int(row["id"]), float(new_amount), new_category.strip(), new_date.strip(), new_note.strip() if new_note else None)
+                        update_tx(
+                            conn,
+                            user_id,
+                            int(row["id"]),
+                            float(new_amount),
+                            new_category.strip(),
+                            new_date.strip(),
+                            new_note.strip() if new_note else None,
+                        )
                         st.success("Updated")
                         st.rerun()
                     else:
@@ -595,8 +813,9 @@ else:
                     st.warning("Deleted")
                     st.rerun()
 
+
 # Footer
-st.caption("SpendWise project • Liu Zerui (RW0KYH) • Dubrovskaia Elena (OAC994)")
+st.caption("SpendWise project • Dubrovskaia Elena (OAC994) • Liu Zerui (RW0KYH)")
 
 # only for report (to show databases)
 st.markdown("## Database Inspection (Debug)")
